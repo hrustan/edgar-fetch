@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import time
 
 import pandas as pd
@@ -38,8 +39,9 @@ def _parse_label(label: str) -> tuple[int, int]:
     return int(year), int(qtr)
 
 
-def list_quarters(start: str = DEFAULT_START) -> list[str]:
-    qs = form4._quarters(pd.Timestamp(start), pd.Timestamp.today().normalize())
+def list_quarters(start: str = DEFAULT_START, end: str | None = None) -> list[str]:
+    end_ts = pd.Timestamp(end) if end else pd.Timestamp.today().normalize()
+    qs = form4._quarters(pd.Timestamp(start), end_ts)
     return [_label(y, q) for (y, q) in qs]
 
 
@@ -96,13 +98,22 @@ def build_all(start: str = DEFAULT_START) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Build the EDGAR Form 4 purchase cache.")
     ap.add_argument("--start", default=DEFAULT_START, help="sample start (YYYY-MM-DD)")
+    ap.add_argument("--end", default=None, help="sample end (YYYY-MM-DD); default today")
     ap.add_argument("--list-quarters", action="store_true",
                     help="print JSON array of quarter labels and exit (for a CI matrix)")
     ap.add_argument("--quarter", help="build exactly one quarter (e.g. 2015Q3) and exit")
     args = ap.parse_args()
 
+    # Stream the form4 logger's INFO records to stdout (live in a CI runner log). Skipped
+    # for --list-quarters so its sole stdout line stays clean JSON for the matrix.
+    if not args.list_quarters:
+        logging.basicConfig(
+            level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+            datefmt="%H:%M:%S",
+        )
+
     if args.list_quarters:
-        print(json.dumps(list_quarters(args.start)))
+        print(json.dumps(list_quarters(args.start, args.end)))
     elif args.quarter:
         build_one(args.quarter)
     else:

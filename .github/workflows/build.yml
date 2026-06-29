@@ -10,6 +10,9 @@ on:
       start:
         description: "Sample start (YYYY-MM-DD)"
         default: "2003-01-01"
+      end:
+        description: "Sample end (YYYY-MM-DD); blank = today"
+        default: ""
 
 permissions:
   contents: read
@@ -31,7 +34,10 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - id: gen
-        run: echo "quarters=$(python build_data.py --list-quarters --start '${{ inputs.start }}')" >> "$GITHUB_OUTPUT"
+        run: |
+          END_ARG=""
+          if [ -n "${{ inputs.end }}" ]; then END_ARG="--end ${{ inputs.end }}"; fi
+          echo "quarters=$(python build_data.py --list-quarters --start '${{ inputs.start }}' $END_ARG)" >> "$GITHUB_OUTPUT"
 
   build:
     needs: list

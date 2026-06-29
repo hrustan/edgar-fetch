@@ -18,6 +18,7 @@ throttled request rate under 10/s.
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import threading
@@ -27,6 +28,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pandas as pd
+
+# Module logger. The library never configures handlers (so unit tests stay quiet); the
+# entrypoint (build_data.py) calls logging.basicConfig to stream INFO to stdout, which is
+# what shows up live in a GitHub Actions runner log.
+log = logging.getLogger("form4")
 
 # git-ignored parquet cache (AGENTS.md: cache pulled data, never commit it). The location
 # is overridable via FORM4_CACHE_DIR so the same module works in the repo layout and in a
@@ -45,6 +51,8 @@ _USER_AGENT = os.environ.get(
 _MIN_INTERVAL = 0.11  # seconds between requests globally (~9/s, under SEC's 10/s ceiling)
 _RETRIES = 4
 _WORKERS = 10  # concurrent fetchers; the shared throttle still caps the aggregate rate
+_LOG_EVERY = int(os.environ.get("FORM4_LOG_EVERY", "200"))  # heartbeat cadence (filings)
+_LOG_PURCHASES = os.environ.get("FORM4_LOG_PURCHASES", "1") not in ("0", "false", "False")
 
 _FORM4_TYPES = {"4"}  # original Form 4 only; "4/A" amendments restate and are excluded
 
@@ -106,15 +114,22 @@ def _get(session, throttle: _Throttle, url: str) -> str | None:
         throttle.wait()
         try:
             r = session.get(url, timeout=60)
-        except Exception:
+        except Exception as e:
+            log.debug("network error (attempt %d) on %s: %s", attempt + 1, url, e)
             time.sleep(0.5 * (attempt + 1))
             continue
         if r.status_code == 200:
             return r.text
         if r.status_code in (403, 429) or r.status_code >= 500:
-            time.sleep(1.0 * (attempt + 1))  # back off on rate-limit / server error
+            # Rate-limited / server error: back off and retry. Surfaced so the runner log
+            # shows when SEC is throttling us.
+            log.warning("HTTP %d (attempt %d/%d), backing off: %s",
+                        r.status_code, attempt + 1, _RETRIES, url)
+            time.sleep(1.0 * (attempt + 1))
             continue
+        log.debug("HTTP %d (no retry): %s", r.status_code, url)
         return None  # 404 etc. -> nothing to retry
+    log.warning("giving up after %d attempts: %s", _RETRIES, url)
     return None
 
 
@@ -130,6 +145,7 @@ def load_ticker_map(session=None, throttle=None, refresh: bool = False) -> pd.Da
     own = session is None
     session = session or _session()
     throttle = throttle or _Throttle()
+    log.info("fetching CIK->ticker map: https://www.sec.gov/files/company_tickers.json")
     txt = _get(session, throttle, "https://www.sec.gov/files/company_tickers.json")
     if txt is None:
         raise RuntimeError("could not fetch company_tickers.json from SEC")
@@ -140,6 +156,7 @@ def load_ticker_map(session=None, throttle=None, refresh: bool = False) -> pd.Da
         for v in json.loads(txt).values()
     ]
     df = pd.DataFrame(rows).drop_duplicates("cik").set_index("cik").sort_index()
+    log.info("ticker map: %d listed issuers", len(df))
     cache.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(cache)
     if own:
@@ -167,6 +184,7 @@ def _form4_index(session, throttle: _Throttle, year: int, qtr: int) -> pd.DataFr
     if cache.exists():
         return pd.read_parquet(cache)
     url = f"https://www.sec.gov/Archives/edgar/full-index/{year}/QTR{qtr}/form.idx"
+    log.info("%dQ%d: fetching quarterly index %s", year, qtr, url)
     txt = _get(session, throttle, url)
     if txt is None:
         raise RuntimeError(f"could not fetch form.idx for {year} QTR{qtr}")
@@ -188,6 +206,7 @@ def _form4_index(session, throttle: _Throttle, year: int, qtr: int) -> pd.DataFr
         rows.append((int(cik), name, date, path))
     df = pd.DataFrame(rows, columns=["issuer_cik", "issuer_name", "filing_date", "path"])
     df["filing_date"] = pd.to_datetime(df["filing_date"])
+    log.info("%dQ%d: index lists %d Form 4 filings", year, qtr, len(df))
     cache.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(cache)
     return df
@@ -264,7 +283,8 @@ def _parse_form4(xml: str) -> list[dict]:
 
 def _fetch_filing(session, throttle: _Throttle, row) -> tuple[bool, list[dict]]:
     """Fetch+parse one Form 4 filing. Returns (fetched_ok, purchase_rows)."""
-    txt = _get(session, throttle, f"https://www.sec.gov/Archives/{row.path}")
+    url = f"https://www.sec.gov/Archives/{row.path}"
+    txt = _get(session, throttle, url)
     if txt is None:
         return False, []
     m = _OWNERSHIP_RE.search(txt)
@@ -273,7 +293,30 @@ def _fetch_filing(session, throttle: _Throttle, row) -> tuple[bool, list[dict]]:
     recs = _parse_form4(m.group(0))
     for rec in recs:
         rec["filing_date"] = row.filing_date
+        if _LOG_PURCHASES:
+            # Log every open-market purchase found, with the source filing URL.
+            log.info(
+                "  BUY %-6s %s  %s sh @ $%s  txn=%s filed=%s  %s",
+                rec.get("issuer_ticker") or "?",
+                (rec.get("owner_name") or "?")[:28],
+                _fmt(rec.get("shares")),
+                _fmt(rec.get("price")),
+                _date(rec.get("txn_date")),
+                _date(row.filing_date),
+                url,
+            )
     return True, recs
+
+
+def _fmt(x) -> str:
+    return f"{x:,.0f}" if isinstance(x, (int, float)) and x == x else "?"
+
+
+def _date(x) -> str:
+    try:
+        return pd.Timestamp(x).date().isoformat()
+    except Exception:
+        return "?"
 
 
 def _load_quarter(
@@ -294,13 +337,17 @@ def _load_quarter(
     if cache.exists() and not refresh:
         return pd.read_parquet(cache)
 
-    idx = _form4_index(session, throttle, year, qtr)
-    if ciks is not None:
-        idx = idx[idx["issuer_cik"].isin(ciks)]
+    idx_all = _form4_index(session, throttle, year, qtr)
+    idx = idx_all[idx_all["issuer_cik"].isin(ciks)] if ciks is not None else idx_all
+    rows = list(idx.itertuples(index=False))
+    log.info(
+        "%dQ%d: fetching %d filings (%d after CIK filter of %d listed) with %d workers",
+        year, qtr, len(rows), len(idx), len(ciks) if ciks is not None else 0, len(idx_all),
+    )
 
     records: list[dict] = []
     n_fetch = n_fail = 0
-    rows = list(idx.itertuples(index=False))
+    t0 = time.monotonic()
     with ThreadPoolExecutor(max_workers=workers) as ex:
         for ok, recs in ex.map(lambda r: _fetch_filing(session, throttle, r), rows):
             n_fetch += 1
@@ -308,12 +355,26 @@ def _load_quarter(
                 n_fail += 1
             else:
                 records.extend(recs)
+            if n_fetch % _LOG_EVERY == 0:
+                elapsed = time.monotonic() - t0
+                rate = n_fetch / elapsed if elapsed else 0.0
+                remaining = (len(rows) - n_fetch) / rate if rate else 0.0
+                log.info(
+                    "%dQ%d: %d/%d filings (%.0f%%) | %.1f/s | %d buys | %d failed | "
+                    "~%.0f min left",
+                    year, qtr, n_fetch, len(rows), 100 * n_fetch / max(len(rows), 1),
+                    rate, len(records), n_fail, remaining / 60,
+                )
 
     df = pd.DataFrame(records, columns=COLUMNS)
     if not df.empty:
         df = df.dropna(subset=["issuer_ticker", "owner_cik", "filing_date"])
     df.attrs["n_filings_fetched"] = n_fetch
     df.attrs["n_fetch_failed"] = n_fail
+    log.info(
+        "%dQ%d: DONE -> %d purchase rows from %d filings (%d failed) in %.0fs",
+        year, qtr, len(df), n_fetch, n_fail, time.monotonic() - t0,
+    )
     cache.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(cache)
     return df
