@@ -1,0 +1,117 @@
+name: build-nport
+
+# Fans the EDGAR NPORT-P parse across one runner per quarter, then bundles the per-quarter
+# parquet caches into one downloadable artifact. Public repo -> free unlimited standard-runner
+# minutes. NOTE: GitHub runners share Azure egress IPs, so concurrent jobs can collide on one
+# IP and trip SEC's 10 req/s per-IP limit -> 429s and, if sustained, a soft-ban of that IP.
+# max-parallel is kept low to limit collisions; the fetcher honors Retry-After + exponential
+# backoff and refuses to cache a quarter that lost >5% of fetches (see form4.py, reused by
+# nport.py). Use the `quarters` input to surgically rebuild only the quarters that came back
+# holed. Public NPORT-P only starts ~2019Q4, so the quarter list is short, but each quarter is
+# a heavy all-fund parse -- max-parallel stays low. Each quarter emits TWO products: holdings
+# (<Q>.parquet) and fund flows (<Q>_funds.parquet); both are cached, uploaded, and bundled.
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "Sample start (YYYY-MM-DD); public NPORT-P begins ~2019Q4"
+        default: "2019-07-01"
+      end:
+        description: "Sample end (YYYY-MM-DD); blank = today"
+        default: ""
+      quarters:
+        description: 'Explicit JSON list to (re)build, e.g. ["2020Q1","2023Q2"]; blank = full start/end range'
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT }}
+  NPORT_CACHE_DIR: ${{ github.workspace }}/data/edgar/nport
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    outputs:
+      quarters: ${{ steps.gen.outputs.quarters }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - id: gen
+        env:
+          QUARTERS: ${{ inputs.quarters }}
+          START: ${{ inputs.start }}
+          END: ${{ inputs.end }}
+        run: |
+          if [ -n "$QUARTERS" ]; then
+            # Targeted rebuild: use the explicit quarter list verbatim.
+            echo "quarters=$QUARTERS" >> "$GITHUB_OUTPUT"
+          else
+            END_ARG=""
+            if [ -n "$END" ]; then END_ARG="--end $END"; fi
+            echo "quarters=$(python build_data_nport.py --list-quarters --start "$START" $END_ARG)" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: list
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # Low to limit shared-egress-IP collisions against SEC's per-IP rate limit. Public-repo
+      # runner minutes are free, so the wall-clock cost of less parallelism is irrelevant.
+      max-parallel: 10
+      matrix:
+        quarter: ${{ fromJson(needs.list.outputs.quarters) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      # Restore previously-built products (both holdings and fund flows) so reruns skip work.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            data/edgar/nport/${{ matrix.quarter }}.parquet
+            data/edgar/nport/${{ matrix.quarter }}_funds.parquet
+          key: nport-${{ matrix.quarter }}-v1
+      - name: Build ${{ matrix.quarter }}
+        run: python build_data_nport.py --quarter '${{ matrix.quarter }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: q-${{ matrix.quarter }}
+          path: |
+            data/edgar/nport/${{ matrix.quarter }}.parquet
+            data/edgar/nport/${{ matrix.quarter }}_funds.parquet
+          if-no-files-found: error
+          retention-days: 7
+
+  merge:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: q-*
+          path: quarters
+          merge-multiple: true
+      - name: Bundle the per-quarter parquet caches
+        run: |
+          mkdir -p out
+          find quarters -name '*.parquet' -exec cp {} out/ \;
+          ls -la out
+          tar -C out -czf nport_cache.tar.gz .
+          echo "bundled $(ls out | wc -l) quarter parquets"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nport_cache
+          path: nport_cache.tar.gz
+          retention-days: 7

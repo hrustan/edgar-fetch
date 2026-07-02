@@ -18,8 +18,9 @@ exponential backoff, a >5%-fail-fraction guard that refuses to cache a holed qua
 |---|---|---|---|---|---|
 | **Form 4** | open-market insider purchases (Code "P") | `build_data.py` | `build-form4` | `data/edgar/form4/` | `form4_cache` |
 | **13F-HR** | institutional holdings (best-ideas inputs) | `build_data_13f.py` | `build-13f` | `data/edgar/thirteen_f/` | `thirteenf_cache` |
+| **NPORT-P** | open-end fund holdings + monthly flows (fire-sale inputs) | `build_data_nport.py` | `build-nport` | `data/edgar/nport/` | `nport_cache` |
 
-Both are keyed on the **filing date** (point-in-time) and respect SEC fair access
+All are keyed on the **filing date** (point-in-time) and respect SEC fair access
 (descriptive `User-Agent` + throttle under 10 req/s). Each driver runs three ways:
 
 ```bash
@@ -45,8 +46,8 @@ python build_data_13f.py                      # build everything (sequential; sl
 
 Shared-IP note: GitHub runners share Azure egress IPs, so concurrent jobs can collide on
 one IP and trip SEC's per-IP limit. `max-parallel` is kept low (12 for Form 4, 10 for the
-heavier all-filer 13F parse) and the fetcher backs off; use the `quarters` input to rebuild
-any quarter that came back holed.
+heavier all-filer 13F and NPORT-P parses) and the fetcher backs off; use the `quarters`
+input to rebuild any quarter that came back holed.
 
 ## Output schemas
 
@@ -56,5 +57,11 @@ any quarter that came back holed.
 - **13F-HR** — one row per long equity holding: `filer_cik, filer_name, filing_date,
   period_of_report, cusip, name_of_issuer, value_usd, shares, is_amendment`. `value_usd` is
   normalized to whole dollars across the 2023 thousands-to-dollars `<value>` scale break.
+- **NPORT-P** — two products per quarter. Holdings (`<Q>.parquet`), one row per long
+  common-equity position: `series_id, filing_date, period_of_report, cusip, name_of_issuer,
+  shares, val_usd, pct_val`. Fund flows (`<Q>_funds.parquet`), one row per fund-quarter:
+  `series_id, reg_cik, fund_name, filing_date, period_of_report, net_assets, redemption,
+  sales, reinvestment, ret_m1, ret_m2, ret_m3, n_eq_holdings, is_amendment` (flows are the
+  quarter's three public monthly figures summed; returns are class-averaged).
 
 Data is public SEC EDGAR; this tool only parses it.
