@@ -8,6 +8,9 @@ present. Every ``NPORT-P`` in the quarterly index is fetched; funds with no long
 common-equity holding or below the net-asset floor are dropped at parse time to bound the
 cache. Point-in-time: every row carries the index ``filing_date``, never the quarter-end.
 
+Also exposes the pressure-panel reduction (write_pressure_panel / load_pressure_panel): the
+compact forced-seller holdings slice shipped in place of the ~46M-row raw cache.
+
 Reuses the hardened EDGAR fetch spine from :mod:`form4` (session, throttle, retry/backoff,
 quarter enumeration) and the XML helpers from :mod:`edgar` (namespace strip, flat-tag text,
 CUSIP normalization), so fair-access behavior and parsing match the other pipelines.
@@ -400,3 +403,156 @@ def load_cached_funds(
 ) -> pd.DataFrame:
     """Read the per-quarter NPORT-P fund-level (flows/returns/net-assets) cache (no network)."""
     return _load_cached("funds", start, end, columns)
+
+
+# Columns the fire-sale signal actually needs from the (very large) holdings table.
+_SIGNAL_HOLDING_COLUMNS = ["series_id", "period_of_report", "filing_date", "cusip", "val_usd"]
+
+
+def load_cached_holdings_for_funds(
+    keep: pd.DataFrame,
+    start: str = DEFAULT_START,
+    end: str | None = None,
+    columns: list[str] | None = None,
+) -> pd.DataFrame:
+    """Memory-frugal holdings load: only rows whose ``[series_id, period_of_report]`` is in
+    ``keep``.
+
+    The full holdings cache is ~46M rows (>1.3GB), which does not fit comfortably in memory.
+    The fire-sale signal only ever uses holdings of forced-seller funds (a small minority each
+    quarter, see :func:`signal.forced_seller_pairs`), so this reads each quarter's parquet
+    pruned to the signal columns and inner-joins it to ``keep`` before concatenating. The full
+    table is never materialized. ``keep`` is a frame with at least
+    ``[series_id, period_of_report]``.
+    """
+    cols = columns or _SIGNAL_HOLDING_COLUMNS
+    keep = keep[["series_id", "period_of_report"]].drop_duplicates().copy()
+    # Normalize the join key: cloud parquet lands as datetime64[us] while a concatenated fund
+    # frame can carry object/NaT periods; coerce both sides to datetime so merge keys align.
+    keep["period_of_report"] = pd.to_datetime(
+        keep["period_of_report"], errors="coerce"
+    ).astype("datetime64[ns]")
+    end_ts = pd.Timestamp(end) if end else pd.Timestamp.today().normalize()
+    start_ts = pd.Timestamp(start)
+    wanted = {f"{y}Q{q}" for (y, q) in _quarters(start_ts, end_ts)}
+    files = sorted(
+        f for f in _CACHE.glob("*Q*.parquet")
+        if not f.stem.endswith("_funds") and f.stem in wanted
+    )
+    if not files:
+        raise FileNotFoundError(
+            f"no cached NPORT-P holdings quarters under {_CACHE}; run build_data.py (or the "
+            "edgar-fetch matrix) first"
+        )
+    parts = []
+    for f in files:
+        h = pd.read_parquet(f, columns=cols)
+        h["period_of_report"] = pd.to_datetime(
+            h["period_of_report"], errors="coerce"
+        ).astype("datetime64[ns]")
+        parts.append(h.merge(keep, on=["series_id", "period_of_report"], how="inner"))
+    out = pd.concat(parts, ignore_index=True)
+    return out.sort_values("filing_date").reset_index(drop=True)
+
+
+# --------------------------------------------------------------------------------------
+# Pressure-panel reduction (cloud reduce -> compact local artifact)
+# --------------------------------------------------------------------------------------
+# The full per-quarter holdings cache is ~46M rows / 1.3GB, which is heavy to ship and OOMs a
+# 16GB laptop. But the fire-sale signal only ever touches holdings of forced-seller funds
+# (the bottom flow decile each quarter). The pressure panel is that pre-filtered, pre-joined
+# slice, produced once in the cloud (reduce_data.py in the edgar-fetch matrix) and downloaded
+# as a ~60MB artifact in place of the 1.3GB raw cache. It is EXACT, not lossy: the signal
+# computes the precise bottom-decile cutoff on the full (tiny) fund table, and the panel is a
+# superset of every run's forced-seller holdings (built at PANEL_FLOW_PCT >= any run's cutoff).
+PANEL_FLOW_PCT = 0.20  # superset margin over the 0.10 headline / 0.05 robustness decile cuts
+_PANEL_HOLDINGS_FILE = "pressure_panel.parquet"
+_PANEL_FUNDS_FILE = "pressure_funds.parquet"
+
+
+def _forced_candidate_pairs(funds: pd.DataFrame, flow_pct: float = PANEL_FLOW_PCT) -> pd.DataFrame:
+    """``[series_id, period_of_report]`` of net-outflow funds in the bottom ``flow_pct`` of net
+    flow each quarter.
+
+    Kept in sync with :func:`strategies.fund_fire_sale.signal.forced_seller_pairs` (duplicated
+    here, not imported, because this module is flat-copied into the public edgar-fetch matrix
+    where strategy code is absent; it is plain flow arithmetic, no signal parameters).
+    """
+    f = funds.copy()
+    for c in ("sales", "reinvestment", "redemption", "net_assets"):
+        f[c] = pd.to_numeric(f[c], errors="coerce")
+    f["period_of_report"] = pd.to_datetime(
+        f["period_of_report"], errors="coerce"
+    ).astype("datetime64[ns]")
+    net_flow = f["sales"].fillna(0) + f["reinvestment"].fillna(0) - f["redemption"].fillna(0)
+    flow_frac = net_flow / f["net_assets"].where(f["net_assets"] > 0)
+    f = f.assign(net_flow=net_flow, flow_frac=flow_frac)
+    f = f[(f["net_flow"] < 0) & f["flow_frac"].notna()]
+    if f.empty:
+        return pd.DataFrame(columns=["series_id", "period_of_report"])
+    cut = f.groupby("period_of_report")["flow_frac"].transform(lambda s: s.quantile(flow_pct))
+    return (
+        f[f["flow_frac"] <= cut][["series_id", "period_of_report"]]
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+
+
+def write_pressure_panel(
+    out_dir: str | Path | None = None,
+    flow_pct: float = PANEL_FLOW_PCT,
+    start: str = DEFAULT_START,
+    end: str | None = None,
+) -> tuple[Path, Path]:
+    """Reduce the raw NPORT-P cache to the compact pressure panel + fund table, and write both.
+
+    Writes ``pressure_panel.parquet`` (forced-candidate holdings, the bottom ``flow_pct`` of
+    outflow funds' long common equity) and ``pressure_funds.parquet`` (the full fund-flow
+    table, already small) under ``out_dir`` (default the cache dir). Returns the two paths.
+    This is the cloud reduce step; locally you download the two files instead of the 1.3GB
+    raw cache and read them with :func:`load_pressure_panel`.
+    """
+    out = Path(out_dir) if out_dir else _CACHE
+    funds = load_cached_funds(start=start, end=end)
+    for c in ("period_of_report", "filing_date"):
+        funds[c] = pd.to_datetime(funds[c], errors="coerce").astype("datetime64[ns]")
+    keep = _forced_candidate_pairs(funds, flow_pct=flow_pct)
+    panel = load_cached_holdings_for_funds(keep, start=start, end=end)
+    out.mkdir(parents=True, exist_ok=True)
+    hpath = out / _PANEL_HOLDINGS_FILE
+    fpath = out / _PANEL_FUNDS_FILE
+    panel.to_parquet(hpath)
+    funds.to_parquet(fpath)
+    log.info(
+        "pressure panel: %d forced-candidate holding rows (flow_pct=%.0f%%) from %d "
+        "fund-quarters -> %s (%.0f MB) + %s",
+        len(panel), 100 * flow_pct, len(funds), hpath.name,
+        hpath.stat().st_size / 1e6, fpath.name,
+    )
+    return hpath, fpath
+
+
+def load_pressure_panel(cache_dir: str | Path | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Read the compact pressure panel: returns ``(funds, holdings)`` ready for the signal.
+
+    ``funds`` is the full fund-flow table; ``holdings`` is the forced-candidate holdings slice.
+    Both feed :func:`strategies.fund_fire_sale.signal.stock_pressure` unchanged (the panel is a
+    superset of the forced-seller holdings, so the result is identical to the raw cache). Raises
+    :class:`FileNotFoundError` if the panel has not been produced (run reduce_data.py or the
+    edgar-fetch reduce job).
+    """
+    d = Path(cache_dir) if cache_dir else _CACHE
+    hpath, fpath = d / _PANEL_HOLDINGS_FILE, d / _PANEL_FUNDS_FILE
+    if not (hpath.exists() and fpath.exists()):
+        raise FileNotFoundError(
+            f"no pressure panel under {d} (expected {_PANEL_HOLDINGS_FILE} + "
+            f"{_PANEL_FUNDS_FILE}); run strategies/fund_fire_sale/reduce_data.py or the "
+            "edgar-fetch reduce job"
+        )
+    funds = pd.read_parquet(fpath)
+    holdings = pd.read_parquet(hpath)
+    for frame in (funds, holdings):
+        for c in ("period_of_report", "filing_date"):
+            if c in frame.columns:
+                frame[c] = pd.to_datetime(frame[c], errors="coerce").astype("datetime64[ns]")
+    return funds, holdings

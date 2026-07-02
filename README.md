@@ -62,6 +62,11 @@ input to rebuild any quarter that came back holed.
   shares, val_usd, pct_val`. Fund flows (`<Q>_funds.parquet`), one row per fund-quarter:
   `series_id, reg_cik, fund_name, filing_date, period_of_report, net_assets, redemption,
   sales, reinvestment, ret_m1, ret_m2, ret_m3, n_eq_holdings, is_amendment` (flows are the
-  quarter's three public monthly figures summed; returns are class-averaged).
+  quarter's three public monthly figures summed; returns are class-averaged). The `build-nport`
+  workflow also runs a **reduce** job (`reduce_data_nport.py`) that shrinks the ~1.3GB raw
+  holdings cache to a compact **pressure panel** artifact (`nport_panel`: `pressure_panel.parquet`
+  ~25MB, the bottom-flow-decile forced-seller holdings, plus `pressure_funds.parquet` ~12MB, the
+  full fund-flow table). Consumers download that ~37MB panel instead of the raw cache; the
+  reduction is exact (a superset of every downstream run's forced sellers).
 
 Data is public SEC EDGAR; this tool only parses it.

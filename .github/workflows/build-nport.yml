@@ -115,3 +115,38 @@ jobs:
           name: nport_cache
           path: nport_cache.tar.gz
           retention-days: 7
+
+  # Reduce the raw 1.3GB holdings cache to the compact fire-sale pressure panel (~37MB): the
+  # forced-seller holdings slice + the small fund-flow table. Consumers download this instead
+  # of the raw cache, so the 1.3GB never lands on a laptop. Runs in the cloud after the merge.
+  reduce:
+    needs: merge
+    runs-on: ubuntu-latest
+    env:
+      NPORT_CACHE_DIR: ${{ github.workspace }}/data/edgar/nport
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: nport_cache
+          path: bundle
+      - name: Unpack the raw quarter cache
+        run: |
+          mkdir -p data/edgar/nport
+          tar -xzf bundle/nport_cache.tar.gz -C data/edgar/nport
+          echo "unpacked $(ls data/edgar/nport/*.parquet | wc -l) parquet files"
+      - name: Reduce to the pressure panel
+        run: python reduce_data_nport.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nport_panel
+          path: |
+            data/edgar/nport/pressure_panel.parquet
+            data/edgar/nport/pressure_funds.parquet
+          if-no-files-found: error
+          retention-days: 7
