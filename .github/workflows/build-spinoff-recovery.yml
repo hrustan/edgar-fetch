@@ -1,0 +1,142 @@
+name: build-spinoff-recovery
+
+# Recovers DELISTED spinoff price histories for the survivorship-hole re-attack: for the
+# ~2,485 Form 10 registrants that do NOT resolve to a current ticker (the losers absent from
+# the free primary pass), resolve the historical trading symbol (SEC submissions API -> Form 10
+# cover-page parse) and pull daily prices (Yahoo -> Stooq). One runner per registration-date
+# quarter; each emits a per-quarter recovery index plus the recovered per-ticker price parquets,
+# bundled into one downloadable artifact.
+#
+# NOTE: GitHub runners share Azure egress IPs, so concurrent jobs can collide on one IP and trip
+# SEC's 10 req/s per-IP limit -> 429s. max-parallel is kept low; form4.py's fetch spine (reused
+# by form10.py + recover.py) honors Retry-After + exponential backoff. The full Form 10 index is
+# pre-built ONCE in the `list` job and shared to every runner as an artifact, so the 107 runners
+# don't each re-fetch all 107 quarterly indexes (which would hammer the shared IP).
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "Sample start (YYYY-MM-DD); modern spinoff regime begins 2000"
+        default: "2000-01-01"
+      end:
+        description: "Sample end (YYYY-MM-DD); blank = today"
+        default: ""
+      quarters:
+        description: 'Explicit JSON list to (re)build, e.g. ["2015Q2","2018Q1"]; blank = full range'
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT }}
+  FORM10_CACHE_DIR: ${{ github.workspace }}/data/edgar/form10
+  SPINOFF_DELISTED_CACHE_DIR: ${{ github.workspace }}/data/prices/spinoff_delisted
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    outputs:
+      quarters: ${{ steps.gen.outputs.quarters }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - id: gen
+        env:
+          QUARTERS: ${{ inputs.quarters }}
+          START: ${{ inputs.start }}
+          END: ${{ inputs.end }}
+        run: |
+          if [ -n "$QUARTERS" ]; then
+            echo "quarters=$QUARTERS" >> "$GITHUB_OUTPUT"
+          else
+            END_ARG=""
+            if [ -n "$END" ]; then END_ARG="--end $END"; fi
+            echo "quarters=$(python build_data_spinoff_recovery.py --list-quarters --start "$START" $END_ARG)" >> "$GITHUB_OUTPUT"
+          fi
+      # Pre-build the full Form 10 quarterly index once and hand it to every build runner, so
+      # they resolve the earliest-filing cohort without each re-fetching all quarterly indexes.
+      - name: Pre-build the Form 10 index
+        env:
+          START: ${{ inputs.start }}
+          END: ${{ inputs.end }}
+        run: |
+          END_ARG=""
+          if [ -n "$END" ]; then END_ARG="end='$END'"; else END_ARG="end=None"; fi
+          python -c "import form10; form10.load_registrants(start='$START', $END_ARG)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: form10-index
+          path: data/edgar/form10/_index/*.parquet
+          if-no-files-found: error
+          retention-days: 7
+
+  recover:
+    needs: list
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 8   # low to limit shared-egress-IP collisions against SEC's per-IP limit
+      matrix:
+        quarter: ${{ fromJson(needs.list.outputs.quarters) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Restore the shared Form 10 index
+        uses: actions/download-artifact@v4
+        with:
+          name: form10-index
+          path: data/edgar/form10/_index
+      # Restore this quarter's recovery products so reruns skip finished work.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            data/edgar/form10/_recovery/${{ matrix.quarter }}.parquet
+            data/prices/spinoff_delisted
+          key: spinoff-recovery-${{ matrix.quarter }}-v1
+      - name: Recover ${{ matrix.quarter }}
+        run: python build_data_spinoff_recovery.py --quarter '${{ matrix.quarter }}' --start '${{ inputs.start }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: q-${{ matrix.quarter }}
+          path: |
+            data/edgar/form10/_recovery/${{ matrix.quarter }}.parquet
+            data/prices/spinoff_delisted/*.parquet
+          if-no-files-found: warn
+          retention-days: 7
+
+  merge:
+    needs: recover
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: q-*
+          path: quarters
+          merge-multiple: true
+      - name: Bundle recovery indexes + recovered price parquets
+        run: |
+          mkdir -p out/recovery out/prices
+          # Per-quarter recovery indexes look like 2015Q2.parquet; price parquets are ticker files.
+          find quarters -name '*Q*.parquet' -exec cp {} out/recovery/ \;
+          find quarters -name '*.parquet' ! -name '*Q*.parquet' -exec cp {} out/prices/ \;
+          echo "recovery indexes: $(ls out/recovery | wc -l)   price parquets: $(ls out/prices | wc -l)"
+          tar -C out -czf spinoff_recovery_cache.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spinoff_recovery_cache
+          path: spinoff_recovery_cache.tar.gz
+          retention-days: 7
+# Import into chakravarti: download spinoff_recovery_cache, extract so recovery/*.parquet land
+# under data/edgar/form10/_recovery/ and prices/*.parquet under data/prices/spinoff_delisted/,
+# then run: python strategies/spinoff/validate_recovery.py
